@@ -42,6 +42,6 @@ class QRScannerViewTests: XCTestCase {
             XCTFail()
         }
         qrScanner.configure(delegate: delegate)
-        wait(for: [exp], timeout: 0.1)
+        wait(for: [exp], timeout: 2.0)
     }
 }

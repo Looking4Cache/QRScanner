@@ -75,8 +75,10 @@ public class QRScannerView: UIView {
             self.isBlurEffectEnabled = isBlurEffectEnabled
         }
 
-        configureSession()
+        // Add the preview layer before configuring the session. Attaching it changes the session configuration,
+        // which must not overlap with startRunning.
         addPreviewLayer()
+        configureSession()
         setupBlurEffectView()
         setupImageViews()
         
@@ -88,14 +90,14 @@ public class QRScannerView: UIView {
         guard !session.isRunning else { return }
         videoDataOutputEnable = false
         metadataOutputEnable = true
-        metadataQueue.async { [weak self] in
+        sessionQueue.async { [weak self] in
             self?.session.startRunning()
         }
     }
 
     public func stopRunning() {
         guard session.isRunning else { return }
-        videoDataQueue.async { [weak self] in
+        sessionQueue.async { [weak self] in
             self?.session.stopRunning()
         }
         metadataOutputEnable = false
@@ -145,8 +147,11 @@ public class QRScannerView: UIView {
         setTorchActive(isOn: false)
         focusImageView.removeFromSuperview()
         qrCodeImageView.removeFromSuperview()
-        session.inputs.forEach { session.removeInput($0) }
-        session.outputs.forEach { session.removeOutput($0) }
+        let session = self.session
+        sessionQueue.async {
+            session.inputs.forEach { session.removeInput($0) }
+            session.outputs.forEach { session.removeOutput($0) }
+        }
         removePreviewLayer()
         torchActiveObservation = nil
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
@@ -155,6 +160,9 @@ public class QRScannerView: UIView {
     // MARK: - Private
 
     private weak var delegate: QRScannerViewDelegate?
+    // All changes of the capture session (configuration, start, stop, orientation) run serially on this queue.
+    // startRunning must never be called while another thread is between beginConfiguration and commitConfiguration.
+    private let sessionQueue = DispatchQueue(label: "session.qrreader.queue")
     private let metadataQueue = DispatchQueue(label: "metadata.session.qrreader.queue")
     private let videoDataQueue = DispatchQueue(label: "videoData.session.qrreader.queue")
     private let session = AVCaptureSession()
@@ -201,6 +209,12 @@ public class QRScannerView: UIView {
     }
 
     private func configureSession() {
+        sessionQueue.async { [weak self] in
+            self?.configureSessionOnSessionQueue()
+        }
+    }
+
+    private func configureSessionOnSessionQueue() {
         // check device initialize
         guard let videoDevice = AVCaptureDevice.default(for: .video) else {
             failure(.deviceFailure(.videoUnavailable))
@@ -235,8 +249,15 @@ public class QRScannerView: UIView {
         videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         videoDataOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
         session.addOutput(videoDataOutput)
+        // Set once here instead of for every frame in captureOutput, changing it reconfigures the session
+        videoDataOutput.connection(with: .video)?.videoOrientation = .portrait
 
         session.commitConfiguration()
+
+        // The preview layer got its connection with the input above
+        DispatchQueue.main.async { [weak self] in
+            self?.updatePreviewLayerForDeviceOrientation()
+        }
 
         // torch observation
         if videoDevice.hasTorch {
@@ -249,9 +270,8 @@ public class QRScannerView: UIView {
         if authorizationStatus() == .notDetermined {
             videoDataOutputEnable = false
             metadataOutputEnable = true
-            metadataQueue.async { [weak self] in
-                self?.session.startRunning()
-            }
+            // Already on the session queue, after commitConfiguration
+            session.startRunning()
         }
     }
 
@@ -297,7 +317,11 @@ public class QRScannerView: UIView {
         default:
             videoOrientation = .portrait
         }
-        self.previewLayer?.connection?.videoOrientation = videoOrientation
+        // Changing the orientation reconfigures the session > serialize with start/stop
+        guard let connection = self.previewLayer?.connection else { return }
+        sessionQueue.async {
+            connection.videoOrientation = videoOrientation
+        }
     }
 
     private func removePreviewLayer() {
@@ -354,6 +378,13 @@ public class QRScannerView: UIView {
     }
 
     private func failure(_ error: QRScannerError) {
+        // May be called on the session queue
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.failure(error)
+            }
+            return
+        }
         delegate?.qrScannerView(self, didFailure: error)
     }
 
@@ -390,7 +421,6 @@ extension QRScannerView: AVCaptureMetadataOutputObjectsDelegate {
 
 extension QRScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        connection.videoOrientation = .portrait
         guard videoDataOutputEnable else { return }
         guard let qrCodeImage = getImageFromSampleBuffer(sampleBuffer: sampleBuffer) else { return }
 
